@@ -31,12 +31,29 @@
 #include <soc/qcom/scm.h>
 #include "core.h" /* Matching kernel's drivers/usb/dwc3; no guessed offsets. */
 
+/* Destination window in physical RAM.  Layout: kernel at QKX_ENTRY (text_offset
+ * 0x80000 inside QKX_LO), then the initramfs, then the DTB; QKX_HI is the top.
+ * The initramfs window (QKX_DTB - QKX_INITRD) was 2 MiB, which fit Quest Pro's
+ * tiny BusyBox initramfs but not a full OS ramdisk - SteamOS's is ~19 MiB
+ * (internal) to ~39 MiB (USB installer).  It is grown to 48 MiB here; the DTB
+ * keeps its 2 MiB.  On Quest 2 (hollywood/kona) this window sits in one clean
+ * System RAM band, above the highest firmware carveout (pil_spss ends
+ * 0x8bf00000) and below the next one up (ramoops at 0x9ba00000).  Regardless of
+ * device, both this loader (qkx_ram_cb) and the host prepare.py (check_ram)
+ * require the whole window to be one System RAM extent with no reserved
+ * sub-region in the live map, so a window that is not clear fails staging
+ * instead of corrupting a boot. */
 #define QKX_LO 0x90000000ULL
-#define QKX_HI 0x93400000ULL
+#define QKX_HI 0x96200000ULL
 #define QKX_ENTRY 0x90080000ULL
 #define QKX_INITRD 0x93000000ULL
-#define QKX_DTB 0x93200000ULL
-/* Includes held allocations that land inside the destination window. */
+#define QKX_DTB 0x96000000ULL
+#define QKX_INITRD_MAX (QKX_DTB - QKX_INITRD)	/* 48 MiB */
+#define QKX_DTB_MAX (QKX_HI - QKX_DTB)		/* 2 MiB */
+/* Bounds total pages held during staging, including allocations that land
+ * inside the destination window and are parked until unload.  The largest real
+ * payload (kernel image_size up to QKX_INITRD-QKX_ENTRY plus a 48 MiB initramfs
+ * plus the DTB) is under 25k copy pages, well below this. */
 #define QKX_MAX_PAGES 32768
 #define QKX_DESC_COUNT ((PAGE_SIZE - 16) / 16)
 
@@ -1089,7 +1106,8 @@ static int __init qkx_init(void)
 	rsize = i_size_read(file_inode(rf));
 	dsize = i_size_read(file_inode(df));
 	ret = -EINVAL;
-	if (ksize < sizeof(kh) || !rsize || rsize > SZ_2M || dsize < sizeof(dh) || dsize > SZ_2M)
+	if (ksize < sizeof(kh) || !rsize || rsize > QKX_INITRD_MAX ||
+	    dsize < sizeof(dh) || dsize > QKX_DTB_MAX)
 		goto out;
 	ret = qkx_read(kf, kh, sizeof(kh), &pos);
 	if (ret)

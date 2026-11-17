@@ -15,6 +15,21 @@ import subprocess
 import zlib
 from pathlib import Path
 
+# Destination window in physical RAM.  Must match module/loader.c exactly.
+# The initramfs window (QKX_DTB - QKX_INITRD) was 2 MiB and is grown to 48 MiB
+# so a full OS ramdisk fits (SteamOS: ~19 MiB internal, ~39 MiB USB installer);
+# the DTB keeps 2 MiB.  The window stays in one clean System RAM band on Quest
+# Pro and Quest 2 (above the top firmware carveout, below the next one up), and
+# check_ram() below still re-validates it against the live /proc/iomem.
+QKX_LO = 0x90000000
+QKX_ENTRY = 0x90080000
+QKX_INITRD = 0x93000000
+QKX_DTB = 0x96000000
+QKX_HI = 0x96200000
+QKX_IMAGE_MAX = QKX_INITRD - QKX_ENTRY   # kernel image_size ceiling (47.5 MiB)
+QKX_INITRD_MAX = QKX_DTB - QKX_INITRD    # 48 MiB
+QKX_DTB_MAX = QKX_HI - QKX_DTB           # 2 MiB
+
 
 def align(n, a):
     return (n + a - 1) & -a
@@ -100,16 +115,17 @@ def main():
         report.update(text_offset=offset, image_size=size, flags=flags,
                       image_file_size=len(kernel), replacement_kernel=str(a.kernel_image),
                       kernel_sha256=hashlib.sha256(kernel).hexdigest())
-    if report["text_offset"] != 0x80000 or report["image_size"] > 0x2F80000:
-        raise ValueError("image does not fit this Quest Pro staging layout")
+    if report["text_offset"] != 0x80000 or report["image_size"] > QKX_IMAGE_MAX:
+        raise ValueError("image does not fit the kexec staging layout")
     initrd = a.initramfs.read_bytes() if a.initramfs else original
     dtb = a.live_dtb.read_bytes()
     if len(dtb) < 40 or struct.unpack_from(">I", dtb)[0] != 0xD00DFEED:
         raise ValueError("invalid live DTB")
-    if len(initrd) > 0x200000 or len(dtb) > 0x200000:
+    if len(initrd) > QKX_INITRD_MAX or len(dtb) > QKX_DTB_MAX:
         raise ValueError("initramfs/DTB exceeds staging limits")
-    # Leave a single exclusion window for source, descriptor and control pages.
-    check_ram(a.iomem.read_text(), 0x90000000, 0x3400000)
+    # The whole destination window must be one System RAM extent, free of any
+    # reserved sub-region, in the live map.
+    check_ram(a.iomem.read_text(), QKX_LO, QKX_HI - QKX_LO)
     a.output.mkdir(parents=True, exist_ok=True)
     (a.output / "Image").write_bytes(kernel)
     if original:
@@ -124,12 +140,12 @@ def main():
     if not a.keep_watchdog:
         subprocess.run(["fdtput", "-t", "s", str(dtpath), "/soc/qcom,wdt@17c10000",
                         "status", "disabled"], check=True)
-    for name, address in (("linux,initrd-start", 0x93000000),
-                          ("linux,initrd-end", 0x93000000 + len(initrd))):
+    for name, address in (("linux,initrd-start", QKX_INITRD),
+                          ("linux,initrd-end", QKX_INITRD + len(initrd))):
         subprocess.run(["fdtput", "-t", "x", str(dtpath), "/chosen", name,
                         "0", f"{address:x}"], check=True)
-    report.update(kernel_address=0x90080000, initrd_address=0x93000000,
-                  dtb_address=0x93200000, initrd_size=len(initrd),
+    report.update(kernel_address=QKX_ENTRY, initrd_address=QKX_INITRD,
+                  dtb_address=QKX_DTB, initrd_size=len(initrd),
                   dtb_size=dtpath.stat().st_size, effective_cmdline=args,
                   replacement_initramfs=a.initramfs is not None,
                   crc32={name: f"{zlib.crc32(content):08x}" for name, content in
