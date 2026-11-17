@@ -82,6 +82,7 @@ static bool warm_reset_test;
 static bool flush_rpmh;
 static bool suspend_syncboss;
 static bool disconnect_qmp;
+static bool warm_reset_hang;
 module_param(image, charp, 0);
 module_param(initrd, charp, 0);
 module_param(dtb, charp, 0);
@@ -106,6 +107,8 @@ module_param(suspend_syncboss, bool, 0);
 MODULE_PARM_DESC(suspend_syncboss, "Suspend the syncboss SPI device (Quest 2: spi1.0) through its PM callback before kexec, stopping active GPI DMA");
 module_param(disconnect_qmp, bool, 0);
 MODULE_PARM_DESC(disconnect_qmp, "Cleanly close Android AOP QMP channels and publish mcore LINK_DOWN before kexec");
+module_param(warm_reset_hang, bool, 0);
+MODULE_PARM_DESC(warm_reset_hang, "Set the PMIC PS_HOLD reset type to warm before the jump, so a watchdog-bite reset after a target hang preserves DDR (retained log / pstore console survive). Diagnostic only.");
 MODULE_PARM_DESC(core_hang_control, "0: untouched; 1: report secure core-hang registers; 2: clear enable bit");
 MODULE_PARM_DESC(secure_watchdog_control, "0: untouched; 1: report SCM availability; 2: try supported secure-watchdog disable signatures");
 MODULE_PARM_DESC(phase_delay_ms, "Pause at pre-freeze checkpoints, maximum 5000 ms");
@@ -660,6 +663,9 @@ static int __maybe_unused qkx_execute(void)
 		(void *)lookup("dwc3_gadget_suspend");
 	int (*rpmh_flush_fn)(const struct device *) =
 		(void *)lookup("rpmh_flush");
+	/* PON_POWER_OFF_WARM_RESET; sets the PMIC PS_HOLD reset type so a
+	 * watchdog-bite reset after a target hang keeps DDR in self-refresh. */
+	int (*pon_pwr_off)(int) = (void *)lookup("qpnp_pon_system_pwr_off");
 	struct device *gpu, *watchdog, *usb_core = NULL, *rpmh_dev = NULL;
 	struct device *syncboss = NULL, *qmp_dev = NULL;
 	struct task_struct *wakeup_suppressor = NULL;
@@ -718,6 +724,14 @@ static int __maybe_unused qkx_execute(void)
 		return -ENODEV;
 	}
 	qkx_phase(4, "devices found; mapping watchdog if requested", true);
+	if (warm_reset_hang) {
+		/* Configure the PMIC now, while SPMI is fully up, so a later
+		 * watchdog-bite reset (target hang) is warm and DDR survives. The
+		 * target kernel may override this at its own PON probe; useful when
+		 * it hangs before getting that far. 1 = PON_POWER_OFF_WARM_RESET. */
+		int r = pon_pwr_off ? pon_pwr_off(1) : -ENOENT;
+		pr_emerg("quest_kexec: warm_reset_hang: qpnp_pon_system_pwr_off(WARM)=%d\n", r);
+	}
 	if (preserve_watchdog) {
 		/* The exact seacliff device name above and captured DT identify this
 		 * block. Only WDT0_RST is written; timeouts and enable are preserved.
